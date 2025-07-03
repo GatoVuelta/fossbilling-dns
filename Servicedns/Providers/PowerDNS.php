@@ -10,8 +10,10 @@ use Exonet\Powerdns\Resources\Record;
 class PowerDNS implements DnsHostingProviderInterface {
     private $client;
     private $nsRecords;
+    private $di;
 
-    public function __construct($config) {
+    public function __construct($config, ?\Pimple\Container $di = null) {
+        $this->di = $di;
         $token = $config['apikey'];
         $api_ip = $config['powerdnsapi'];
         if (empty($token)) {
@@ -93,8 +95,9 @@ class PowerDNS implements DnsHostingProviderInterface {
         $subname = $rrsetData['subname'];
         $type = $rrsetData['type'];
         $ttl = $rrsetData['ttl'];
-        $recordValue = $rrsetData['records'][0];
+        $newRecordValue = $rrsetData['records'][0];
 
+        // Convert record type string to RecordType enum
         switch ($type) {
             case 'A':
                 $recordType = RecordType::A;
@@ -120,10 +123,83 @@ class PowerDNS implements DnsHostingProviderInterface {
             default:
                 throw new \FOSSBilling\InformationException("Invalid record type");
         }
-
-        $zone->create($subname, $recordType, $recordValue, $ttl);
-
-        return json_decode($domainName, true);
+        
+        try {
+            // Get the service_dns model that includes the domain ID
+            $db = $this->di['db'];
+            $domain = $db->findOne(
+                'service_dns',
+                'domain_name = :domain_name',
+                [':domain_name' => $domainName]
+            );
+            
+            if (!$domain) {
+                throw new \FOSSBilling\InformationException("Domain not found in database: {$domainName}");
+            }
+            
+            $domainId = $domain['id'];
+            
+            // Retrieve all existing records with the same host and type from the database
+            $existingRecords = $this->di['db']->getAll(
+                'SELECT value FROM service_dns_records WHERE domain_id = :domain_id AND type = :type AND host = :host',
+                [
+                    ':domain_id' => $domainId,
+                    ':type' => $type,
+                    ':host' => $subname
+                ]
+            );
+            
+            // Collect all existing record values
+            $recordValues = [];
+            foreach ($existingRecords as $record) {
+                $recordValues[] = $record['value'];
+            }
+            
+            // Add the new record if it doesn't already exist
+            if (!in_array($newRecordValue, $recordValues)) {
+                $recordValues[] = $newRecordValue;
+            }
+            
+            // Prepare records in the format expected by PowerDNS
+            $recordsArray = [];
+            foreach ($recordValues as $recordContent) {
+                // Create a proper Record object instead of an array
+                $record = new \Exonet\Powerdns\Resources\Record();
+                $record
+                    ->setContent($recordContent)
+                    ->setDisabled(false);
+                $recordsArray[] = $record;
+            }
+            
+            // Format the subname to be canonical (ending with dot)
+            if ($subname === '' || $subname === '@') {
+                // For the root domain
+                $canonicalName = $domainName . '.';
+            } else {
+                // For subdomains - ensure it ends with domain and dot
+                if (strpos($subname, $domainName) === false) {
+                    $canonicalName = $subname . '.' . $domainName . '.';
+                } else {
+                    // If subname already includes domain, just ensure it ends with dot
+                    $canonicalName = rtrim($subname, '.') . '.';
+                }
+            }
+            
+            // Use the patch method to update all records at once with REPLACE changetype
+            $resourceRecord = new \Exonet\Powerdns\Resources\ResourceRecord();
+            $resourceRecord->setName($canonicalName)
+                ->setType($recordType)
+                ->setTtl($ttl)
+                ->setRecords($recordsArray)
+                ->setChangetype('REPLACE');
+                
+            $zone->patch([$resourceRecord]);
+            
+            return json_decode($domainName, true);
+            
+        } catch (\Exception $e) {
+            throw new \FOSSBilling\InformationException("Error creating record: " . $e->getMessage());
+        }
     }
 
     public function createBulkRRsets($domainName, $rrsetDataArray) {

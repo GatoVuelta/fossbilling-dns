@@ -45,7 +45,7 @@ class Service implements InjectionAwareInterface
                 $this->dnsProvider = new Providers\Hetzner($config);
                 break;
             case 'PowerDNS':
-                $this->dnsProvider = new Providers\PowerDNS($config);
+                $this->dnsProvider = new Providers\PowerDNS($config, $this->di);
                 break;
             case 'Vultr':
                 $this->dnsProvider = new Providers\Vultr($config);
@@ -234,23 +234,83 @@ class Service implements InjectionAwareInterface
             throw new \FOSSBilling\InformationException("DNS provider is not set.");
         }
         
-        $this->dnsProvider->createRRset($config['domain_name'], $rrsetData);
-
-        $model->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($model);
-        
-        $records = $this->di['db']->dispense('service_dns_records');
         $domainName = isset($order->config) ? json_decode($order->config)->domain_name : null;
         $domain_id = $this->di['db']->findOne('service_dns', 'domain_name = :domain_name', [':domain_name' => $domainName]);
-        $records->domain_id = $domain_id['id'];
-        $records->type = $data['record_type'];
-        $records->host = $data['record_name'];
-        $records->value = $data['record_value'];
-        $records->ttl = (int) $data['record_ttl'];
-        $records->priority = (isset($data['record_priority']) && $data['record_priority'] !== '') ? $data['record_priority'] : 0;
-        $records->created_at = date('Y-m-d H:i:s');
-        $records->updated_at = date('Y-m-d H:i:s');
-        $this->di['db']->store($records);
+        
+        // Special handling for CNAME records - they must be unique per hostname
+        if ($data['record_type'] === 'CNAME') {
+            // Check if any other record type exists with the same hostname
+            $conflictingRecords = $this->di['db']->findOne('service_dns_records', 
+                'domain_id = :domain_id AND host = :host AND type != :type', 
+                [
+                    ':domain_id' => $domain_id['id'],
+                    ':host' => $data['record_name'],
+                    ':type' => 'CNAME'
+                ]
+            );
+            
+            if ($conflictingRecords) {
+                throw new \FOSSBilling\InformationException("Cannot add CNAME record: The hostname '{$data['record_name']}' already has other record types assigned to it.");
+            }
+        } else {
+            // Check if a CNAME record exists with the same hostname
+            $existingCname = $this->di['db']->findOne('service_dns_records', 
+                'domain_id = :domain_id AND type = :type AND host = :host', 
+                [
+                    ':domain_id' => $domain_id['id'],
+                    ':type' => 'CNAME',
+                    ':host' => $data['record_name']
+                ]
+            );
+            
+            if ($existingCname) {
+                throw new \FOSSBilling\InformationException("Cannot add {$data['record_type']} record: The hostname '{$data['record_name']}' already has a CNAME record assigned to it.");
+            }
+        }
+        
+        // Check if a record with the same domain_id, type, host, and value already exists
+        $existingRecord = $this->di['db']->findOne('service_dns_records', 
+            'domain_id = :domain_id AND type = :type AND host = :host AND value = :value', 
+            [
+                ':domain_id' => $domain_id['id'],
+                ':type' => $data['record_type'],
+                ':host' => $data['record_name'],
+                ':value' => $data['record_value']
+            ]
+        );
+
+        if ($existingRecord) {
+            // Return an error if an exact duplicate record is being added
+            throw new \FOSSBilling\InformationException(
+                sprintf(
+                    'A DNS record with the same host, type, and value already exists: %s %s %s', 
+                    $data['record_name'], 
+                    $data['record_type'], 
+                    $data['record_value']
+                )
+            );
+        } else {
+            // Call the DNS provider's API to create the record
+            // Some providers like PowerDNS will handle duplicates gracefully
+            $this->dnsProvider->createRRset($config['domain_name'], $rrsetData);
+
+            $model->updated_at = date('Y-m-d H:i:s');
+            $this->di['db']->store($model);
+            
+            $currentTime = date('Y-m-d H:i:s');
+            
+            // Create a new record as no duplicate exists
+            $records = $this->di['db']->dispense('service_dns_records');
+            $records->domain_id = $domain_id['id'];
+            $records->type = $data['record_type'];
+            $records->host = $data['record_name'];
+            $records->value = $data['record_value'];
+            $records->ttl = (int) $data['record_ttl'];
+            $records->priority = (isset($data['record_priority']) && $data['record_priority'] !== '') ? $data['record_priority'] : 0;
+            $records->created_at = $currentTime;
+            $records->updated_at = $currentTime;
+            $this->di['db']->store($records);
+        }
 
         return true;
     }
