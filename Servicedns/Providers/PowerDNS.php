@@ -163,7 +163,6 @@ class PowerDNS implements DnsHostingProviderInterface {
             // Prepare records in the format expected by PowerDNS
             $recordsArray = [];
             foreach ($recordValues as $recordContent) {
-                // Create a proper Record object instead of an array
                 $record = new \Exonet\Powerdns\Resources\Record();
                 $record
                     ->setContent($recordContent)
@@ -171,9 +170,7 @@ class PowerDNS implements DnsHostingProviderInterface {
                 $recordsArray[] = $record;
             }
             
-            // Format the subname to be canonical (ending with dot)
             if ($subname === '' || $subname === '@') {
-                // For the root domain
                 $canonicalName = $domainName . '.';
             } else {
                 // For subdomains - ensure it ends with domain and dot
@@ -292,7 +289,79 @@ class PowerDNS implements DnsHostingProviderInterface {
                 throw new \FOSSBilling\InformationException("Invalid record type");
         }
 
-        $zone->find($subname, $recordType)->delete();
+        try {
+            if (!$this->di) {
+                throw new \FOSSBilling\InformationException("Dependency injection container not available");
+            }
+            
+            // Get the service_dns model that includes the domain ID
+            $db = $this->di['db'];
+            $domain = $db->findOne(
+                'service_dns',
+                'domain_name = :domain_name',
+                [':domain_name' => $domainName]
+            );
+            
+            if (!$domain) {
+                throw new \FOSSBilling\InformationException("Domain not found: {$domainName}");
+            }
+            
+            $domainId = $domain['id'];
+            
+            // Retrieve all existing records with the same host and type from the database EXCEPT the one we want to delete
+            $existingRecords = $db->getAll(
+                'SELECT value FROM service_dns_records WHERE domain_id = :domain_id AND type = :type AND host = :host AND value != :value',
+                [
+                    ':domain_id' => $domainId,
+                    ':type' => $type,
+                    ':host' => $subname,
+                    ':value' => $value
+                ]
+            );
+            
+            // If there are no remaining records, delete the entire RRset
+            if (empty($existingRecords)) {
+                $zone->find($subname, $recordType)->delete();
+            } else {
+                // Otherwise, update the RRset with the remaining records
+                $recordValues = [];
+                foreach ($existingRecords as $record) {
+                    $recordValues[] = $record['value'];
+                }
+                
+                // Format the subname to be canonical (ending with dot)
+                if ($subname === '' || $subname === '@') {
+                    $canonicalName = $domainName . '.';
+                } else {
+                    if (strpos($subname, $domainName) === false) {
+                        $canonicalName = $subname . '.' . $domainName . '.';
+                    } else {
+                        $canonicalName = rtrim($subname, '.') . '.';
+                    }
+                }
+                
+                $recordsArray = [];
+                foreach ($recordValues as $recordContent) {
+                    $record = new \Exonet\Powerdns\Resources\Record();
+                    $record
+                        ->setContent($recordContent)
+                        ->setDisabled(false);
+                    $recordsArray[] = $record;
+                }
+                
+                // Use the patch method to update with remaining records
+                $resourceRecord = new \Exonet\Powerdns\Resources\ResourceRecord();
+                $resourceRecord->setName($canonicalName)
+                    ->setType($recordType)
+                    ->setTtl(3600) // Use a default TTL since we don't have the original
+                    ->setRecords($recordsArray)
+                    ->setChangetype('REPLACE');
+                    
+                $zone->patch([$resourceRecord]);
+            }
+        } catch (\Exception $e) {
+            throw new \FOSSBilling\InformationException("Error deleting record: {$e->getMessage()}");
+        }
         
         return json_decode($domainName, true);
     }
